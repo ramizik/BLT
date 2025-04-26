@@ -28,6 +28,9 @@ client = WebClient(token=SLACK_TOKEN)
 # Add at the top with other environment variables
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
 
+# REPLACE DEVELOPMENT WORKSPACE WITH OWASP WORKSPACE
+# REMOVE NGROK FROM .GITIGNORE
+
 # Replace GSoC cache with hardcoded project data
 GSOC_PROJECTS = [
     {
@@ -131,7 +134,7 @@ def slack_events(request):
                     slack_integration = SlackIntegration.objects.get(workspace_name=team_id)
                     workspace_token = slack_integration.bot_access_token
                 except SlackIntegration.DoesNotExist:
-                    if team_id == "T04T40NHX":  # OWASP workspace
+                    if team_id == "T08N3167RA5":  # TODO: REPLACE WITH OWASP WORKSPACE
                         workspace_token = SLACK_TOKEN
                     else:
                         return JsonResponse(
@@ -228,8 +231,8 @@ def _handle_team_join(user_id, request):
                 welcome_message = slack_integration.welcome_message
                 workspace_client = WebClient(token=slack_integration.bot_access_token)
             else:
-                # If no welcome message but it's OWASP workspace
-                if team_id == "T04T40NHX":
+                # If no welcome message but it's TODO: REPLACE WITH TODO: REPLACE WITH OWASP WORKSPACE
+                if team_id == "T08N3167RA5":
                     workspace_client = WebClient(token=SLACK_TOKEN)
                     welcome_message = (
                         f":tada: *Welcome to the OWASP Slack Community, <@{user_id}>!* :tada:\n\n"
@@ -283,8 +286,8 @@ def _handle_team_join(user_id, request):
                     )
 
         except SlackIntegration.DoesNotExist:
-            # If no integration exists but it's OWASP workspace
-            if team_id == "T04T40NHX":
+            # If no integration exists but it's TODO: REPLACE WITH TODO: REPLACE WITH OWASP WORKSPACE
+            if team_id == "T08N3167RA5":
                 workspace_client = WebClient(token=SLACK_TOKEN)
                 # Use the default OWASP welcome message
                 welcome_message = (
@@ -376,7 +379,7 @@ def slack_commands(request):
             slack_integration = SlackIntegration.objects.get(workspace_name=team_id)
             workspace_client = WebClient(token=slack_integration.bot_access_token)
         except SlackIntegration.DoesNotExist:
-            if team_id == "T04T40NHX":
+            if team_id == "T08N3167RA5":
                 workspace_client = WebClient(token=SLACK_TOKEN)
             else:
                 return JsonResponse(
@@ -1384,7 +1387,7 @@ def get_gsoc_overview(workspace_client, user_id, search_term, activity, team_id)
         ]
 
         # Add workspace-specific content
-        if team_id == "T04T40NHX":  # OWASP workspace
+        if team_id == "T08N3167RA5":  # TODO: REPLACE WITH TODO: REPLACE WITH OWASP WORKSPACE
             blocks.extend(
                 [
                     {
