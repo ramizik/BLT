@@ -126,6 +126,22 @@ class SlackIntegration(models.Model):
     def __str__(self):
         return f"Slack Integration for {self.integration.organization.name}"
 
+class VulnerabilitySubscription(models.Model):
+    user_id = models.CharField(max_length=50)  # Slack user ID
+    workspace_id = models.CharField(max_length=50)  # Slack workspace ID
+    product = models.CharField(max_length=255)  # Product to monitor
+    vendor = models.CharField(max_length=255, blank=True)  # Optional vendor filter
+    min_severity = models.FloatField(default=7.0)  # Minimum CVSS score to alert on
+    created = models.DateTimeField(auto_now_add=True)
+    
+class VulnerabilityAlert(models.Model):
+    cve_id = models.CharField(max_length=20)
+    published_date = models.DateTimeField()
+    last_modified_date = models.DateTimeField()
+    description = models.TextField()
+    cvss_score = models.FloatField(null=True, blank=True)
+    notified_users = models.JSONField(default=list)
+    created = models.DateTimeField(auto_now_add=True)
 
 class OrganisationType(Enum):
     ORGANIZATION = "organization"

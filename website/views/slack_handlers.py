@@ -124,7 +124,7 @@ def slack_events(request):
 
         if request.content_type == "application/x-www-form-urlencoded":
             try:
-                # Handle Interactive Components
+                # Handle Interactive Components+
                 payload = json.loads(request.POST.get("payload", "{}"))
                 team_id = payload.get("team", {}).get("id")
                 user_id = payload.get("user", {}).get("id")
@@ -798,8 +798,46 @@ def slack_commands(request):
                 activity.save()
                 return JsonResponse({"response_type": "ephemeral", "text": "Error reporting bug. Please try again."})
 
+        elif command == "/vuln-track":
+            search_term = request.POST.get("text", "").strip()
+
+            # Parse the command arguments: product [vendor] [min_severity]
+            args = search_term.split()
+            if not args or args[0].lower() == "help":
+                # Show help message
+                help_blocks = [
+                    {
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn", 
+                            "text": "*Vulnerability Tracking Commands*\n"
+                                "• `/vuln-track subscribe <product> [vendor] [min_severity]` - Subscribe to vulnerability alerts\n"
+                                "• `/vuln-track list` - List your current subscriptions\n"
+                                "• `/vuln-track unsubscribe <id>` - Unsubscribe from alerts\n"
+                                "• `/vuln-track latest` - Show latest vulnerabilities"
+                        }
+                    }
+                ]
+                return JsonResponse({"response_type": "ephemeral", "blocks": help_blocks})
+            
+            subcommand = args[0].lower()
+            
+            if subcommand == "subscribe":
+                return handle_vulnerability_subscription(workspace_client, user_id, args[1:], team_id, activity)
+            elif subcommand == "list":
+                return list_vulnerability_subscriptions(workspace_client, user_id, team_id, activity)
+            elif subcommand == "unsubscribe":
+                return handle_vulnerability_unsubscription(workspace_client, user_id, args[1:], team_id, activity)
+            elif subcommand == "latest":
+                return show_latest_vulnerabilities(workspace_client, user_id, args[1:], team_id, activity)
+
+
     return HttpResponse(status=405)
 
+#TODO: Command handlers, testing.
+#TODO: Implement data fetching from NVD
+#TODO: Implement subscription and unsubscription
+#TODO: Implement background proceeses, scheduling for scanning
 
 def get_github_headers():
     """Helper function to get GitHub API headers with authentication"""
