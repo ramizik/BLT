@@ -15,7 +15,7 @@ from django.views.decorators.csrf import csrf_exempt
 from slack_sdk.errors import SlackApiError
 from slack_sdk.web import WebClient
 
-from website.models import Domain, Hunt, Issue, Project, SlackBotActivity, SlackIntegration, User
+from website.models import Domain, Hunt, Issue, Project, SlackBotActivity, SlackIntegration, User, VulnerabilitySubscription, VulnerabilityAlert
 
 if os.getenv("ENV") != "production":
     from dotenv import load_dotenv
@@ -737,7 +737,7 @@ def slack_commands(request):
                 help_message = [
                     {
                         "type": "section",
-                        "text": {"type": "mrkdwn", "text": "*Available Commands*\nHere’s what I can do for you:"},
+                        "text": {"type": "mrkdwn", "text": "*Available Commands*\nHere's what I can do for you:"},
                     },
                     {"type": "divider"},
                     {
@@ -757,10 +757,10 @@ def slack_commands(request):
                 ]
                 dm_response = workspace_client.conversations_open(users=[user_id])
                 if not dm_response["ok"]:
-                    return JsonResponse({"response_type": "ephemeral", "text": "Couldn’t open a DM channel."})
+                    return JsonResponse({"response_type": "ephemeral", "text": "Couldn't open a DM channel."})
                 dm_channel = dm_response["channel"]["id"]
                 workspace_client.chat_postMessage(channel=dm_channel, blocks=help_message, text="Available Commands")
-                return JsonResponse({"response_type": "ephemeral", "text": "I’ve sent you the command list in a DM!"})
+                return JsonResponse({"response_type": "ephemeral", "text": "I've sent you the command list in a DM!"})
             except SlackApiError as e:
                 activity.success = False
                 activity.error_message = f"Slack API error: {str(e)}"
@@ -831,13 +831,14 @@ def slack_commands(request):
             elif subcommand == "latest":
                 return show_latest_vulnerabilities(workspace_client, user_id, args[1:], team_id, activity)
 
-
     return HttpResponse(status=405)
 
+    
 #TODO: Command handlers, testing.
 #TODO: Implement data fetching from NVD
-#TODO: Implement subscription and unsubscription
-#TODO: Implement background proceeses, scheduling for scanning
+#TODO: Implement subscription and unsubscription    
+#TODO: Implement background proceeses, scheduling scanning
+
 
 def get_github_headers():
     """Helper function to get GitHub API headers with authentication"""
@@ -2528,3 +2529,127 @@ def handle_committee_pagination(action, body, client):
     except Exception as e:
         print(f"Error handling committee pagination: {str(e)}")
         return JsonResponse({"response_type": "ephemeral", "text": "❌ An error occurred while navigating committees."})
+
+
+def handle_vulnerability_subscription(workspace_client, user_id, args, team_id, activity):
+    if len(args) < 1:
+        return JsonResponse({
+            "response_type": "ephemeral",
+            "text": "Please provide a product name to track. Example: `/vuln-track subscribe apache log4j 7.0`"
+        })
+    
+    try:
+        product = args[0]
+        vendor = args[1] if len(args) > 1 else ""
+        try:
+            min_severity = float(args[2]) if len(args) > 2 else 7.0
+        except ValueError:
+            min_severity = 7.0
+
+        # Create subscription following the report command pattern
+        subscription = VulnerabilitySubscription.objects.create(
+            user_id=user_id,
+            workspace_id=team_id,
+            product=product,
+            vendor=vendor,
+            min_severity=min_severity
+        )
+        
+        activity.details["subscription_id"] = subscription.id
+        activity.success = True
+        activity.save()
+
+        msg = f"✅ Subscribed to vulnerability alerts for *{product}*"
+        if vendor:
+            msg += f" from *{vendor}*"
+        msg += f" with minimum severity of *{min_severity}*"
+        
+        blocks = [
+            {"type": "section", "text": {"type": "mrkdwn", "text": msg}}
+        ]
+        return JsonResponse({"response_type": "ephemeral", "blocks": blocks})
+        
+    except Exception as e:
+        activity.success = False
+        activity.error_message = "Failed to create subscription"
+        activity.save()
+        return JsonResponse({
+            "response_type": "ephemeral",
+            "text": "Unable to create subscription. Please try again."
+        })
+
+def handle_vulnerability_unsubscription(workspace_client, user_id, args, team_id, activity):
+    if not args:
+        return JsonResponse({
+            "response_type": "ephemeral",
+            "text": "Please provide the subscription ID to unsubscribe. Example: `/vuln-track unsubscribe 123`"
+        })
+    
+    try:
+        sub_id = args[0]
+        subscription = VulnerabilitySubscription.objects.get(
+            id=sub_id,
+            user_id=user_id,
+            workspace_id=team_id
+        )
+        
+        activity.details["subscription_id"] = sub_id
+        subscription.delete()
+        activity.success = True
+        activity.save()
+
+        blocks = [
+            {"type": "section", "text": {"type": "mrkdwn", "text": f"🗑️ Subscription `{sub_id}` removed."}}
+        ]
+        return JsonResponse({"response_type": "ephemeral", "blocks": blocks})
+        
+    except VulnerabilitySubscription.DoesNotExist:
+        activity.success = False
+        activity.error_message = f"Subscription {sub_id} not found"
+        activity.save()
+        return JsonResponse({
+            "response_type": "ephemeral",
+            "text": f"❌ Subscription `{sub_id}` not found or you do not have permission to remove it."
+        })
+
+def list_vulnerability_subscriptions(workspace_client, user_id, team_id, activity):
+    try:
+        subs = VulnerabilitySubscription.objects.filter(
+            user_id=user_id,
+            workspace_id=team_id
+        )
+        
+        if not subs.exists():
+            activity.success = True
+            activity.save()
+            blocks = [
+                {"type": "section", "text": {"type": "mrkdwn", "text": "You have no active vulnerability subscriptions."}}
+            ]
+            return JsonResponse({"response_type": "ephemeral", "blocks": blocks})
+
+        rows = []
+        for sub in subs:
+            rows.append(
+                f"• *ID:* `{sub.id}` | *Product:* `{sub.product}`"
+                + (f" | *Vendor:* `{sub.vendor}`" if sub.vendor else "")
+                + f" | *Min Severity:* `{sub.min_severity}`"
+            )
+
+        activity.success = True
+        activity.details["subscription_count"] = len(rows)
+        activity.save()
+
+        blocks = [
+            {"type": "section", "text": {"type": "mrkdwn", "text": "*Your Vulnerability Subscriptions:*\n" + "\n".join(rows)}},
+            {"type": "context", "elements": [{"type": "mrkdwn", "text": "To unsubscribe, use `/vuln-track unsubscribe <id>`"}]}
+        ]
+        return JsonResponse({"response_type": "ephemeral", "blocks": blocks})
+        
+    except Exception as e:
+        activity.success = False
+        activity.error_message = "Failed to list subscriptions"
+        activity.save()
+        return JsonResponse({
+            "response_type": "ephemeral",
+            "text": "Unable to list subscriptions. Please try again."
+        })
