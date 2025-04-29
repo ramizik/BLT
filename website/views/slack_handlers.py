@@ -6,6 +6,8 @@ import os
 import re
 import threading
 import time
+from datetime import datetime, timedelta
+from django.utils import timezone
 
 import requests
 import yaml
@@ -16,6 +18,8 @@ from slack_sdk.errors import SlackApiError
 from slack_sdk.web import WebClient
 
 from website.models import Domain, Hunt, Issue, Project, SlackBotActivity, SlackIntegration, User, VulnerabilitySubscription, VulnerabilityAlert
+from website.services.nvd_service import NVDService
+from django.conf import settings
 
 if os.getenv("ENV") != "production":
     from dotenv import load_dotenv
@@ -23,6 +27,7 @@ if os.getenv("ENV") != "production":
     load_dotenv()
 SLACK_TOKEN = os.environ.get("SLACK_BOT_TOKEN")
 SIGNING_SECRET = os.environ.get("SLACK_SIGNING_SECRET")
+NVD_API_KEY = os.environ.get("NVD_API_KEY")
 client = WebClient(token=SLACK_TOKEN)
 
 # Add at the top with other environment variables
@@ -814,7 +819,10 @@ def slack_commands(request):
                                 "• `/vuln-track subscribe <product> [vendor] [min_severity]` - Subscribe to vulnerability alerts\n"
                                 "• `/vuln-track list` - List your current subscriptions\n"
                                 "• `/vuln-track unsubscribe <id>` - Unsubscribe from alerts\n"
-                                "• `/vuln-track latest` - Show latest vulnerabilities"
+                                "• `/vuln-track latest [severity] [days]` - Show latest vulnerabilities\n"
+                                "  - `severity`: Filter by severity (LOW, MEDIUM, HIGH, CRITICAL)\n"
+                                "  - `days`: Number of days to look back (default: 7)\n"
+                                "• `/vuln-track product <product> [vendor] [severity]` - Search vulnerabilities by product"
                         }
                     }
                 ]
@@ -2652,4 +2660,366 @@ def list_vulnerability_subscriptions(workspace_client, user_id, team_id, activit
         return JsonResponse({
             "response_type": "ephemeral",
             "text": "Unable to list subscriptions. Please try again."
+        })
+
+def show_latest_vulnerabilities(workspace_client, user_id, args, team_id, activity):
+    """Show latest vulnerabilities based on user criteria with pagination support"""
+    try:
+        # Parse arguments
+        severity = None
+        product = None
+        vendor = None
+        days = 7
+        
+        # Check if first argument is a product search
+        if args and args[0].lower() == "product" and len(args) > 1:
+            product = args[1]
+            if len(args) > 2:
+                vendor = args[2]
+            if len(args) > 3 and args[3].lower() in ["low", "medium", "high", "critical"]:
+                severity = args[3].upper()
+        # Otherwise check if first argument is severity
+        elif args and args[0].lower() in ["low", "medium", "high", "critical"]:
+            severity = args[0].upper()
+            if len(args) > 1:
+                try:
+                    days = int(args[1])
+                except ValueError:
+                    pass
+        # Otherwise check if first argument is days
+        elif args and len(args) >= 1:
+            try:
+                days = int(args[0])
+            except ValueError:
+                pass
+            
+        # Initial response to user that we're processing
+        response = JsonResponse({
+            "response_type": "ephemeral",
+            "text": "🔍 Searching for vulnerabilities... I'll send you the results in a DM shortly."
+        })
+        
+        # Process in the background to avoid timeout
+        threading.Thread(
+            target=process_vulnerability_search,
+            args=(workspace_client, user_id, team_id, severity, product, vendor, days, activity)
+        ).start()
+        
+        return response
+        
+    except Exception as e:
+        activity.success = False
+        activity.error_message = "Failed to fetch vulnerabilities"
+        activity.save()
+        return JsonResponse({
+            "response_type": "ephemeral",
+            "text": "Unable to fetch vulnerabilities. Please try again."
+        })
+
+def process_vulnerability_search(workspace_client, user_id, team_id, severity, product, vendor, days, activity):
+    """Process vulnerability search in background thread"""
+    try:
+        # Initialize NVD service
+        nvd_service = NVDService(api_key=NVD_API_KEY)
+        
+        # Fetch vulnerabilities
+        raw_response = nvd_service.fetch_vulnerabilities(
+            last_mod_start_date=timezone.now() - timedelta(days=days),
+            last_mod_end_date=timezone.now(),
+            cvss_v3_severity=severity,
+            product=product,
+            vendor=vendor
+        )
+        
+        vulnerabilities = raw_response.get("vulnerabilities", [])
+        total_results = raw_response.get("totalResults", 0)
+        
+        if not vulnerabilities:
+            send_dm(
+                workspace_client,
+                user_id,
+                "No vulnerabilities found matching your criteria.",
+                [
+                    {
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": "No vulnerabilities found matching your criteria. Try adjusting your search parameters."
+                        }
+                    }
+                ]
+            )
+            activity.success = True
+            activity.save()
+            return
+        
+        # Format search criteria for display
+        search_criteria = []
+        if severity:
+            search_criteria.append(f"Severity: {severity}")
+        if product:
+            search_criteria.append(f"Product: {product}")
+            if vendor:
+                search_criteria.append(f"Vendor: {vendor}")
+        search_criteria.append(f"Last {days} days")
+        
+        # Save data for pagination
+        pagination_data[user_id] = {
+            "vulnerabilities": vulnerabilities,
+            "current_page": 0,
+            "page_size": 5,
+            "search_criteria": search_criteria,
+            "total_results": total_results
+        }
+        
+        # Send first page of results
+        send_vulnerability_page(workspace_client, user_id, team_id)
+        
+        activity.success = True
+        activity.details = {
+            "severity": severity,
+            "product": product,
+            "vendor": vendor,
+            "days": days,
+            "total_results": total_results
+        }
+        activity.save()
+        
+    except Exception as e:
+        activity.success = False
+        activity.error_message = "Failed to fetch vulnerabilities"
+        activity.save()
+        send_dm(
+            workspace_client,
+            user_id,
+            "Unable to fetch vulnerabilities. Please try again."
+        )
+
+def send_vulnerability_page(workspace_client, user_id, team_id):
+    """Send a page of vulnerability results with pagination controls"""
+    try:
+        data = pagination_data[user_id]
+        vulnerabilities = data["vulnerabilities"]
+        page_size = data["page_size"]
+        current_page = data["current_page"]
+        search_criteria = data["search_criteria"]
+        total_results = data.get("total_results", len(vulnerabilities))
+        
+        total_pages = math.ceil(len(vulnerabilities) / page_size)
+        start_idx = current_page * page_size
+        end_idx = min(start_idx + page_size, len(vulnerabilities))
+        page_vulns = vulnerabilities[start_idx:end_idx]
+        
+        # Format header based on search criteria
+        header_text = "🛡️ Vulnerability Alert"
+        criteria_text = " • ".join(search_criteria)
+        
+        blocks = [
+            {
+                "type": "header",
+                "text": {
+                    "type": "plain_text",
+                    "text": header_text,
+                    "emoji": True
+                }
+            },
+            {
+                "type": "context",
+                "elements": [
+                    {"type": "mrkdwn", "text": f"*Search criteria:* {criteria_text}"}
+                ]
+            },
+            {
+                "type": "context",
+                "elements": [
+                    {"type": "mrkdwn", "text": f"Found {total_results} vulnerabilities • Page {current_page + 1} of {total_pages}"}
+                ]
+            },
+            {"type": "divider"}
+        ]
+        
+        # Format vulnerabilities for Slack
+        for vuln in page_vulns:
+            cve_data = vuln.get("cve", {})
+            metrics = cve_data.get("metrics", {})
+            
+            # First try to get CVSS v3.1 data
+            cvss_data = {}
+            if metrics.get("cvssMetricV31"):
+                cvss_v3 = metrics.get("cvssMetricV31", [{}])[0]
+                cvss_data = cvss_v3.get("cvssData", {})
+            # If not available, try v3.0
+            elif metrics.get("cvssMetricV3"):
+                cvss_v3 = metrics.get("cvssMetricV3", [{}])[0]
+                cvss_data = cvss_v3.get("cvssData", {})
+            # If neither, try v2
+            elif metrics.get("cvssMetricV2"):
+                cvss_v2 = metrics.get("cvssMetricV2", [{}])[0]
+                cvss_data = cvss_v2.get("cvssData", {})
+                
+            # Get description (English version)
+            description = "No description available"
+            if cve_data.get("descriptions"):
+                for desc in cve_data.get("descriptions", []):
+                    if desc.get("lang") == "en":
+                        description = desc.get("value", "No description available")
+                        break
+            
+            # Format date
+            published_date = cve_data.get("published", "Unknown")
+            if published_date and published_date != "Unknown":
+                try:
+                    date_obj = datetime.strptime(published_date, "%Y-%m-%dT%H:%M:%S.%f")
+                    published_date = date_obj.strftime("%Y-%m-%d")
+                except (ValueError, TypeError):
+                    try:
+                        date_obj = datetime.strptime(published_date, "%Y-%m-%dT%H:%M:%S.%fZ")
+                        published_date = date_obj.strftime("%Y-%m-%d")
+                    except (ValueError, TypeError):
+                        try:
+                            date_obj = datetime.strptime(published_date, "%Y-%m-%dT%H:%M:%S")
+                            published_date = date_obj.strftime("%Y-%m-%d")
+                        except (ValueError, TypeError):
+                            pass
+            
+            # Get severity and score
+            severity = cvss_data.get("baseSeverity", "N/A")
+            score = cvss_data.get("baseScore", "N/A")
+            
+            # Determine severity emoji
+            severity_emoji = "⚪️"
+            if severity == "CRITICAL":
+                severity_emoji = "🔴"
+            elif severity == "HIGH":
+                severity_emoji = "🟠"
+            elif severity == "MEDIUM":
+                severity_emoji = "🟡"
+            elif severity == "LOW":
+                severity_emoji = "🟢"
+            
+            # Get CVE ID and create link
+            cve_id = cve_data.get("id", "Unknown")
+            cve_link = f"https://nvd.nist.gov/vuln/detail/{cve_id}"
+            
+            # Create vulnerability block
+            vuln_block = {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": (
+                        f"*<{cve_link}|{cve_id}>* • {published_date}\n"
+                        f"*Severity:* {severity_emoji} {severity} "
+                        f"*Score:* {score}\n"
+                        f"*Description:*\n{description}"
+                    )
+                }
+            }
+            
+            # Add affected products if available
+            if "configurations" in cve_data and cve_data["configurations"]:
+                affected_products = []
+                for config in cve_data["configurations"]:
+                    for node in config.get("nodes", []):
+                        for cpe_match in node.get("cpeMatch", []):
+                            if cpe_match.get("vulnerable", False):
+                                criteria = cpe_match.get("criteria", "")
+                                if criteria.startswith("cpe:2.3:"):
+                                    parts = criteria.split(":")
+                                    if len(parts) > 5:
+                                        vendor_name = parts[3]
+                                        product_name = parts[4]
+                                        version = parts[5]
+                                        if vendor_name != "*" and product_name != "*":
+                                            affected_products.append(f"{vendor_name}:{product_name} v{version}")
+                
+                if affected_products:
+                    # Limit to 5 products to avoid too long messages
+                    if len(affected_products) > 5:
+                        affected_products = affected_products[:5]
+                        affected_products.append("...")
+                    
+                    products_text = "\n".join([f"• {p}" for p in affected_products])
+                    vuln_block["text"]["text"] += f"\n\n*Affected Products:*\n{products_text}"
+            
+            blocks.append(vuln_block)
+            blocks.append({"type": "divider"})
+        
+        # Add pagination controls
+        actions_block = {
+            "type": "actions",
+            "elements": []
+        }
+        
+        # Previous page button
+        if current_page > 0:
+            actions_block["elements"].append({
+                "type": "button",
+                "text": {
+                    "type": "plain_text",
+                    "text": "◀️ Previous",
+                    "emoji": True
+                },
+                "value": "vuln_prev",
+                "action_id": "vuln_pagination_prev"
+            })
+        
+        # Next page button
+        if current_page < total_pages - 1:
+            actions_block["elements"].append({
+                "type": "button",
+                "text": {
+                    "type": "plain_text",
+                    "text": "Next ▶️",
+                    "emoji": True
+                },
+                "value": "vuln_next",
+                "action_id": "vuln_pagination_next"
+            })
+        
+        # Only add the actions block if it has any buttons
+        if actions_block["elements"]:
+            blocks.append(actions_block)
+        
+        # Send results as DM to the user
+        send_dm(
+            workspace_client,
+            user_id,
+            "Vulnerability search results",
+            blocks
+        )
+        
+        return HttpResponse(status=200)
+        
+    except Exception as e:
+        send_dm(
+            workspace_client,
+            user_id,
+            "Error displaying vulnerability results."
+        )
+        return HttpResponse(status=500)
+
+def handle_vuln_pagination(action, body, client):
+    """Handle vulnerability pagination buttons"""
+    try:
+        user_id = body["user"]["id"]
+        team_id = body.get("team", {}).get("id")
+        data = pagination_data.get(user_id)
+
+        if not data:
+            return JsonResponse({
+                "response_type": "ephemeral",
+                "text": "❌ No pagination data found. Please try the command again."
+            })
+
+        if action == "vuln_pagination_prev":
+            data["current_page"] = max(0, data["current_page"] - 1)
+        else:  # vuln_pagination_next
+            data["current_page"] += 1
+            
+        return send_vulnerability_page(client, user_id, team_id)
+        
+    except Exception as e:
+        return JsonResponse({
+            "response_type": "ephemeral",
+            "text": "❌ An error occurred while navigating vulnerabilities."
         })
